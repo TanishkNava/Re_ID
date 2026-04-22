@@ -1,0 +1,5 @@
+# Ignore large weights and videos
+*.mp4
+*.pt
+*.pth
+__pycache__/
