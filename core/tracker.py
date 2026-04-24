@@ -4,6 +4,31 @@ import yaml
 from core.bytetrack.byte_tracker import BYTETracker
 
 
+def _iou_xyxy(a, b) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    xx1, yy1 = max(ax1, bx1), max(ay1, by1)
+    xx2, yy2 = min(ax2, bx2), min(ay2, by2)
+    w, h = max(0.0, xx2 - xx1), max(0.0, yy2 - yy1)
+    inter = w * h
+    if inter <= 0:
+        return 0.0
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    return inter / (area_a + area_b - inter + 1e-7)
+
+
+def _best_det_class_for_bbox(bbox, detections: list) -> int:
+    best_i, best_iou = -1, 0.0
+    for i, d in enumerate(detections):
+        iou = _iou_xyxy(bbox, d["bbox"])
+        if iou > best_iou:
+            best_iou, best_i = iou, i
+    if best_i < 0:
+        return -1
+    return int(detections[best_i]["class_id"])
+
+
 class TrackerArgs:
     """Minimal args object ByteTrack expects."""
     def __init__(self, cfg):
@@ -30,9 +55,12 @@ class PersonTracker:
         if not detections:
             return []
 
-        dets_array = np.array([
-            [*d["bbox"], d["conf"], 0] for d in detections  # Force class_id=0 for person
-        ], dtype=float)
+        # BYTETracker: shape (N,5) => score = col4. Shape (N,6+) => score = col4*col5 (YOLO obj×cls).
+        # conf here is already combined [0,1]; do not pass a dummy 6th column or scores become 0.
+        dets_array = np.array(
+            [[*d["bbox"], d["conf"]] for d in detections],
+            dtype=float,
+        )
 
         img_h, img_w = frame.shape[:2]
         online_targets = self.tracker.update(dets_array, [img_h, img_w], [img_h, img_w])
@@ -78,12 +106,10 @@ class ObjectTracker:
         if not detections:
             return []
 
-        # Preserve original class_ids
-        class_id_map = {i: d["class_id"] for i, d in enumerate(detections)}
-        
-        dets_array = np.array([
-            [*d["bbox"], d["conf"], i] for i, d in enumerate(detections)  # Use index as temp ID
-        ], dtype=float)
+        dets_array = np.array(
+            [[*d["bbox"], d["conf"]] for d in detections],
+            dtype=float,
+        )
 
         img_h, img_w = frame.shape[:2]
         online_targets = self.tracker.update(dets_array, [img_h, img_w], [img_h, img_w])
@@ -96,9 +122,7 @@ class ObjectTracker:
             x1, y1 = max(0, x1), max(0, y1)
             x2, y2 = min(img_w, x2), min(img_h, y2)
 
-            # Get original class_id from detection index
-            det_idx = int(t.cls) if hasattr(t, 'cls') else 0
-            original_class_id = class_id_map.get(det_idx, -1)
+            original_class_id = _best_det_class_for_bbox([x1, y1, x2, y2], detections)
 
             tracks.append({
                 "track_id" : int(t.track_id),

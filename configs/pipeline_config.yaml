@@ -25,7 +25,8 @@ reid:
   model_name: "osnet_x1_0"
   weights: "weights/osnet.pth"
   input_size: [256, 128]
-  device: "cpu"
+  # "cuda" / "cuda:0" when GPU available; set "cpu" to force CPU
+  device: "cuda"
 
 memory:
   cosine_threshold: 0.65

@@ -2,13 +2,17 @@ import cv2
 import base64
 import numpy as np
 import asyncio
+from pathlib import Path
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import yaml
 
 from core.pipeline import Pipeline
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
 
 app = FastAPI()
 app.add_middleware(
@@ -16,7 +20,15 @@ app.add_middleware(
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
 )
 
-pipeline = Pipeline()
+# Lazy init so `import api.server` / uvicorn startup does not load torch until first client.
+_pipeline: Pipeline | None = None
+
+
+def get_pipeline() -> Pipeline:
+    global _pipeline
+    if _pipeline is None:
+        _pipeline = Pipeline()
+    return _pipeline
 
 
 def encode_frame(frame: np.ndarray) -> str:
@@ -27,8 +39,14 @@ def encode_frame(frame: np.ndarray) -> str:
 
 @app.get("/")
 async def root():
-    with open("ui/index.html", encoding="utf-8") as f:
-        return HTMLResponse(f.read())
+    """Browser UI (video + WebSocket client)."""
+    html_path = _REPO_ROOT / "ui" / "index.html"
+    if not html_path.is_file():
+        return JSONResponse(
+            {"error": "ui/index.html not found", "path": str(html_path)},
+            status_code=404,
+        )
+    return HTMLResponse(html_path.read_text(encoding="utf-8"))
 
 
 @app.post("/upload")
@@ -63,8 +81,9 @@ async def websocket_endpoint(websocket: WebSocket):
                 if frame is None:
                     continue
 
-                result      = pipeline.process_frame(frame)
-                annotated   = pipeline.draw(frame.copy(), result)
+                pl = get_pipeline()
+                result      = pl.process_frame(frame)
+                annotated   = pl.draw(frame.copy(), result)
                 encoded     = encode_frame(annotated)
 
                 await websocket.send_json({
@@ -84,8 +103,9 @@ async def websocket_endpoint(websocket: WebSocket):
                     ret, frame = cap.read()
                     if not ret:
                         break
-                    result    = pipeline.process_frame(frame)
-                    annotated = pipeline.draw(frame.copy(), result)
+                    pl = get_pipeline()
+                    result    = pl.process_frame(frame)
+                    annotated = pl.draw(frame.copy(), result)
                     encoded   = encode_frame(annotated)
 
                     await websocket.send_json({
@@ -107,8 +127,9 @@ async def websocket_endpoint(websocket: WebSocket):
                     ret, frame = cap.read()
                     if not ret:
                         break
-                    result    = pipeline.process_frame(frame)
-                    annotated = pipeline.draw(frame.copy(), result)
+                    pl = get_pipeline()
+                    result    = pl.process_frame(frame)
+                    annotated = pl.draw(frame.copy(), result)
                     encoded   = encode_frame(annotated)
 
                     await websocket.send_json({

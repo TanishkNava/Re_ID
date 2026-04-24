@@ -1,5 +1,7 @@
 venv/
+.venv/
 __pycache__/
+weights/_tmp_*
 *.pyc
 input/
 .idea/
