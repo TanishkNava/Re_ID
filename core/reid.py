@@ -10,7 +10,14 @@ class OSNetReID:
         with open(config_path) as f:
             cfg = yaml.safe_load(f)["reid"]
 
-        self.device     = torch.device(cfg["device"] if torch.cuda.is_available() else "cpu")
+        dev = str(cfg.get("device", "cuda")).strip().lower()
+        if dev == "cpu":
+            self.device = torch.device("cpu")
+        elif torch.cuda.is_available():
+            self.device = torch.device(cfg.get("device", "cuda"))
+        else:
+            print("[ReID] CUDA requested but not available; using CPU")
+            self.device = torch.device("cpu")
         self.input_size = tuple(cfg["input_size"])  # (256, 128)
 
         # Build model
