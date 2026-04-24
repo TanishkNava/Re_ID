@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>ReID Tracking Pipeline</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #0f0f0f; color: #eee; font-family: 'Segoe UI', sans-serif; }
+  header { background: #1a1a2e; padding: 16px 24px; display: flex; align-items: center; gap: 12px; }
+  header h1 { font-size: 1.2rem; color: #00e5ff; }
+  .badge { background: #00e5ff22; color: #00e5ff; border: 1px solid #00e5ff55;
+           padding: 3px 10px; border-radius: 20px; font-size: 0.75rem; }
+  .container { display: grid; grid-template-columns: 1fr 320px; height: calc(100vh - 56px); }
+  .viewer { position: relative; background: #000; display: flex; align-items: center; justify-content: center; }
+  #canvas { max-width: 100%; max-height: 100%; }
+  .placeholder { color: #444; font-size: 1rem; text-align: center; }
+  .sidebar { background: #141414; border-left: 1px solid #222; display: flex; flex-direction: column; overflow: hidden; }
+
+  /* Controls */
+  .controls { padding: 16px; border-bottom: 1px solid #222; display: flex; flex-direction: column; gap: 10px; }
+  .controls h2 { font-size: 0.85rem; color: #888; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 4px; }
+  input[type=text], input[type=file] { width: 100%; background: #1e1e1e; border: 1px solid #333;
+    color: #eee; padding: 8px 10px; border-radius: 6px; font-size: 0.85rem; }
+  button { width: 100%; padding: 9px; border-radius: 6px; border: none; cursor: pointer;
+           font-size: 0.85rem; font-weight: 600; transition: opacity 0.2s; }
+  button:hover { opacity: 0.85; }
+  .btn-primary { background: #00e5ff; color: #000; }
+  .btn-danger  { background: #ff4444; color: #fff; }
+  .btn-upload  { background: #7c3aed; color: #fff; }
+
+  /* Stats */
+  .stats { padding: 16px; border-bottom: 1px solid #222; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .stat-box { background: #1e1e1e; border-radius: 8px; padding: 10px; text-align: center; }
+  .stat-box .val { font-size: 1.6rem; font-weight: 700; color: #00e5ff; }
+  .stat-box .lbl { font-size: 0.7rem; color: #666; margin-top: 2px; }
+
+  /* Track list */
+  .track-list { flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 6px; }
+  .track-list h2 { font-size: 0.85rem; color: #888; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 6px; }
+  .track-item { background: #1e1e1e; border-radius: 8px; padding: 8px 12px;
+                border-left: 3px solid #00e5ff; font-size: 0.8rem; }
+  .track-item.object { border-left-color: #6464ff; }
+  .track-item .name { font-weight: 600; color: #eee; }
+  .track-item .meta { color: #666; margin-top: 2px; font-size: 0.72rem; }
+
+  /* Status bar */
+  .status { padding: 8px 16px; background: #0a0a0a; font-size: 0.75rem; color: #555;
+            border-top: 1px solid #1a1a1a; display: flex; justify-content: space-between; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: #333; display: inline-block; margin-right: 6px; }
+  .dot.live { background: #00e5ff; box-shadow: 0 0 6px #00e5ff; animation: pulse 1.2s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>⚡ ReID Tracking Pipeline</h1>
+  <span class="badge">YOLOX + ByteTrack + OSNet</span>
+  <span class="badge" id="mode-badge">Idle</span>
+</header>
+
+<div class="container">
+  <!-- Video viewer -->
+  <div class="viewer">
+    <canvas id="canvas"></canvas>
+    <div class="placeholder" id="placeholder">
+      <div style="font-size:2.5rem;margin-bottom:12px">🎥</div>
+      <div>Upload a video or enter a stream URL to begin</div>
+    </div>
+  </div>
+
+  <!-- Sidebar -->
+  <div class="sidebar">
+    <div class="controls">
+      <h2>Input Source</h2>
+      <input type="text" id="url-input" placeholder="Stream URL (rtsp:// or http://)">
+      <button class="btn-primary" onclick="startStream()">▶ Start Stream</button>
+      <input type="file" id="file-input" accept="video/*">
+      <button class="btn-upload" onclick="uploadVideo()">⬆ Upload Video</button>
+      <button class="btn-danger" onclick="stopAll()">⏹ Stop</button>
+    </div>
+
+    <div class="stats">
+      <div class="stat-box"><div class="val" id="stat-persons">0</div><div class="lbl">Persons</div></div>
+      <div class="stat-box"><div class="val" id="stat-objects">0</div><div class="lbl">Objects</div></div>
+      <div class="stat-box"><div class="val" id="stat-fps">0</div><div class="lbl">FPS</div></div>
+      <div class="stat-box"><div class="val" id="stat-frames">0</div><div class="lbl">Frames</div></div>
+    </div>
+
+    <div class="track-list">
+      <h2>Active Tracks</h2>
+      <div id="tracks-container"></div>
+    </div>
+
+    <div class="status">
+      <span><span class="dot" id="status-dot"></span><span id="status-text">Disconnected</span></span>
+      <span id="status-time"></span>
+    </div>
+  </div>
+</div>
+
+<script>
+  let ws = null;
+  let frameCount = 0;
+  let fpsTimer = null;
+  let fpsCounter = 0;
+
+  const canvas      = document.getElementById("canvas");
+  const ctx         = canvas.getContext("2d");
+  const placeholder = document.getElementById("placeholder");
+
+  function setStatus(text, live = false) {
+    document.getElementById("status-dot").className  = "dot" + (live ? " live" : "");
+    document.getElementById("status-text").textContent = text;
+    document.getElementById("mode-badge").textContent   = live ? "LIVE" : "Idle";
+    document.getElementById("status-time").textContent  = new Date().toLocaleTimeString();
+  }
+
+  function updateStats(persons, objects) {
+    document.getElementById("stat-persons").textContent = persons.length;
+    document.getElementById("stat-objects").textContent = objects.length;
+    document.getElementById("stat-frames").textContent  = ++frameCount;
+    fpsCounter++;
+
+    const container = document.getElementById("tracks-container");
+    container.innerHTML = "";
+
+    persons.forEach(p => {
+      const el = document.createElement("div");
+      el.className = "track-item";
+      el.innerHTML = `<div class="name">🟢 ${p.label}</div>
+        <div class="meta">Track #${p.track_id} · conf ${(p.conf*100).toFixed(0)}% · bbox [${p.bbox.join(", ")}]</div>`;
+      container.appendChild(el);
+    });
+
+    objects.forEach(o => {
+      const el = document.createElement("div");
+      el.className = "track-item object";
+      el.innerHTML = `<div class="name">🔵 Track #${o.track_id}</div>
+        <div class="meta">class_id ${o.class_id} · conf ${(o.conf*100).toFixed(0)}% · bbox [${o.bbox.join(", ")}]</div>`;
+      container.appendChild(el);
+    });
+  }
+
+  function drawFrame(base64img) {
+    const img = new Image();
+    img.onload = () => {
+      canvas.width  = img.width;
+      canvas.height = img.height;
+      ctx.drawImage(img, 0, 0);
+      placeholder.style.display = "none";
+    };
+    img.src = "data:image/jpeg;base64," + base64img;
+  }
+
+  function startFPSCounter() {
+    fpsTimer = setInterval(() => {
+      document.getElementById("stat-fps").textContent = fpsCounter;
+      fpsCounter = 0;
+    }, 1000);
+  }
+
+  function startStream() {
+    const url = document.getElementById("url-input").value.trim();
+    if (!url) return alert("Enter a stream URL first.");
+    connectWS(() => ws.send(JSON.stringify({ type: "url", url })));
+  }
+
+  function connectWS(onOpen) {
+    stopAll();
+    ws = new WebSocket(`ws://${location.host}/ws`);
+    ws.onopen = () => { setStatus("Connected", true); startFPSCounter(); onOpen(); };
+    ws.onclose = () => { setStatus("Disconnected"); clearInterval(fpsTimer); };
+    ws.onerror = () => setStatus("Error");
+    ws.onmessage = (e) => {
+      const data = JSON.parse(e.data);
+      if (data.error) { setStatus("Error: " + data.error); return; }
+      drawFrame(data.image);
+      updateStats(data.persons, data.objects);
+    };
+  }
+
+  function stopAll() {
+    if (ws) { ws.close(); ws = null; }
+    clearInterval(fpsTimer);
+    setStatus("Stopped");
+  }
+async function uploadVideo() {
+  const file = document.getElementById("file-input").files[0];
+  if (!file) return alert("Select a video file first.");
+  
+  setStatus("Uploading...");
+  const form = new FormData();
+  form.append("file", file);
+  const res  = await fetch("/upload", { method: "POST", body: form });
+  const data = await res.json();
+  
+  // Now process via WebSocket
+  connectWS(() => {
+    ws.send(JSON.stringify({ type: "file", path: data.path }));
+  });
+}
+</script>
+</body>
+</html>
