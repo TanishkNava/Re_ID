@@ -2,7 +2,8 @@ detector:
   model_name: "yolox-s"
   weights: "weights/yolox.pth"
   input_size: [640, 640]
-  conf_threshold: 0.3
+  # Raised slightly to reduce false positives (was 0.3)
+  conf_threshold: 0.35
   nms_threshold: 0.45
   class_names:
     - person
@@ -16,9 +17,11 @@ detector:
   person_class_id: 0
 
 tracker:
-  track_thresh: 0.5
-  track_buffer: 30
-  match_thresh: 0.8
+  # Lower track_thresh accepts more detections into active tracks
+  track_thresh: 0.45
+  # 90-frame buffer at 30fps = 3 seconds of patience before dropping track
+  track_buffer: 90
+  match_thresh: 0.85
   frame_rate: 30
 
 reid:
@@ -29,9 +32,18 @@ reid:
   device: "cuda"
 
 memory:
-  cosine_threshold: 0.65
+  # Cosine similarity threshold for Re-ID matching (0..1, higher = stricter)
+  # 0.72 = strict enough that different warehouse workers are not merged,
+  # but forgiving enough to re-ID the same person after brief occlusion
+  cosine_threshold: 0.72
   max_gallery_size: 100
   feature_dim: 512
+  # Seconds after which a gallery entry is expired (person left the scene)
+  ttl_seconds: 300
+  # EMA weight for embedding updates (0=no update, 1=replace)
+  ema_alpha: 0.25
+  # Rolling history size per person
+  max_feats_per_person: 15
 
 api:
   host: "0.0.0.0"
