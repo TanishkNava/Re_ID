@@ -1,0 +1,687 @@
+# Warehouse Person Re-Identification & Tracking System
+### Complete Project Documentation
+
+---
+
+## Table of Contents
+1. [Project Overview](#1-project-overview)
+2. [System Architecture](#2-system-architecture)
+3. [Project Structure](#3-project-structure)
+4. [Module Reference](#4-module-reference)
+5. [How to Run](#5-how-to-run)
+6. [Configuration Reference](#6-configuration-reference)
+7. [Full Changelog — What We Changed & Why](#7-full-changelog--what-we-changed--why)
+8. [Known Limitations](#8-known-limitations)
+
+---
+
+## 1. Project Overview
+
+This system performs **real-time person re-identification and multi-object tracking** in warehouse CCTV footage. It answers the question:
+
+> *"When a worker walks out of frame and comes back, can we automatically recognise them as the same person and assign the same ID?"*
+
+**Core capabilities:**
+- Detects people + warehouse objects (forklifts, pallets, trucks, etc.) using a custom-trained **YOLOX-s** model
+- Tracks every detected entity across frames using **ByteTrack** (motion + IoU)
+- Extracts 512-dimensional appearance embeddings for each person using **OSNet** (deep Re-ID neural network)
+- Matches embeddings against a persistent **gallery** — so `person_1` stays `person_1` even after re-entering the scene
+- Enforces **one-to-one uniqueness per frame** — two different people in the same frame can never share an ID
+- Runs on **NVIDIA GPU (CUDA)** for real-time speed
+
+---
+
+## 2. System Architecture
+
+```
+┌─────────────────────────────────────────────────────┐
+│                    Input Video                       │
+│            (.mp4 / RTSP / uploaded file)             │
+└───────────────────────┬─────────────────────────────┘
+                        │ frame (BGR numpy array)
+                        ▼
+┌─────────────────────────────────────────────────────┐
+│              core/detector.py  (YOLOX-s)            │
+│  • Preprocesses frame to 640×640                    │
+│  • Runs inference → raw detections                  │
+│  • NMS + confidence filtering                       │
+│  • Splits output into:                              │
+│       persons []   ←  class_id == 0                 │
+│       objects []   ←  all other classes             │
+└──────────────┬────────────────────┬─────────────────┘
+               │ person_dets        │ object_dets
+               ▼                    ▼
+┌──────────────────────┐  ┌──────────────────────────┐
+│  PersonTracker       │  │  ObjectTracker            │
+│  ByteTrack           │  │  ByteTrack                │
+│  (Motion + IoU)      │  │  (Motion + IoU only)      │
+│  → track_id, bbox,   │  │  → track_id, bbox, conf,  │
+│    conf, crop        │  │    class_id               │
+└──────────┬───────────┘  └──────────────────────────┘
+           │ person tracks (with image crops)
+           ▼
+┌─────────────────────────────────────────────────────┐
+│              core/reid.py  (OSNet-x1_0)             │
+│  • Resizes crop to 256×128                          │
+│  • ImageNet normalization                           │
+│  • Forward pass → 512-d feature vector             │
+│  • L2 normalization                                 │
+└───────────────────────┬─────────────────────────────┘
+                        │ 512-d embedding per person
+                        ▼
+┌─────────────────────────────────────────────────────┐
+│              core/memory.py  (ReID Gallery)         │
+│                                                     │
+│  begin_frame(active_track_ids)                      │
+│    → resets frame-uniqueness set                    │
+│    → purges dead track→person mappings              │
+│                                                     │
+│  match(embedding, track_id)                         │
+│    1. Fast path: track already matched? → return    │
+│    2. Expire TTL entries                            │
+│    3. Cosine similarity vs all gallery entries      │
+│       (skip IDs already used this frame)            │
+│    4. score >= threshold → existing person          │
+│       score <  threshold → NEW person_N             │
+│    5. EMA-update gallery embedding                  │
+│    6. Cache track_id → person_id                    │
+└─────────────────────────────────────────────────────┘
+                        │ person_id (stable)
+                        ▼
+              Final Result per Frame:
+              persons: [{track_id, person_id, label, bbox, conf}]
+              objects: [{track_id, class_id, bbox, conf}]
+```
+
+---
+
+## 3. Project Structure
+
+```
+Re_ID_t/
+│
+├── main.py                         ← Entry point (CLI + live preview)
+├── requirements.txt                ← All Python dependencies
+├── configs/
+│   └── pipeline_config.yaml        ← All tunable parameters
+│
+├── core/                           ← Core pipeline modules
+│   ├── __init__.py
+│   ├── detector.py                 ← YOLOX-s detector
+│   ├── tracker.py                  ← ByteTrack wrappers (person + object)
+│   ├── reid.py                     ← OSNet feature extractor
+│   ├── memory.py                   ← Re-ID gallery with uniqueness logic
+│   ├── pipeline.py                 ← Per-frame orchestrator
+│   └── bytetrack/                  ← ByteTrack source (vendored)
+│       ├── byte_tracker.py
+│       ├── kalman_filter.py
+│       ├── matching.py
+│       └── basetrack.py
+│
+├── YOLOX/                          ← YOLOX source (vendored)
+│   └── yolox/
+│       ├── exp/
+│       ├── models/
+│       ├── data/
+│       └── utils/
+│
+├── api/
+│   ├── __init__.py
+│   └── server.py                   ← FastAPI WebSocket server (web UI mode)
+│
+├── ui/
+│   └── index.html                  ← Browser-based dashboard
+│
+└── weights/
+    ├── yolox.pth                   ← Custom-trained YOLOX-s weights
+    └── (osnet downloaded auto)     ← OSNet pretrained weights (auto-downloaded)
+```
+
+---
+
+## 4. Module Reference
+
+### `core/detector.py` — `YOLOXDetector`
+
+Wraps the YOLOX-s model for inference.
+
+| Method | Description |
+|---|---|
+| `__init__(config_path)` | Loads model, weights, sets input size and thresholds |
+| `detect(frame)` | Returns `(persons, non_persons)` — two lists of detection dicts |
+
+**Detection dict format:**
+```python
+{
+    "bbox":       [x1, y1, x2, y2],  # pixel coords, clamped to frame
+    "conf":       float,              # obj_conf × cls_conf
+    "class_id":   int,               # 0=person, 1=dock_open, ...
+    "class_name": str
+}
+```
+
+---
+
+### `core/tracker.py` — `PersonTracker` / `ObjectTracker` / `TrackerManager`
+
+Wraps ByteTrack for both streams.
+
+| Class | Purpose |
+|---|---|
+| `PersonTracker` | Tracks persons — adds `crop` (BGR image) to each track dict |
+| `ObjectTracker` | Tracks objects — motion + IoU only, maps class_id back via IoU |
+| `TrackerManager` | Holds both trackers, loads config once |
+
+**Track dict (persons):**
+```python
+{
+    "track_id": int,          # ByteTrack assigned ID (may change on re-entry)
+    "bbox":     [x1,y1,x2,y2],
+    "conf":     float,
+    "class_id": 0,
+    "crop":     np.ndarray    # BGR crop of person ROI — fed to ReID
+}
+```
+
+---
+
+### `core/reid.py` — `OSNetReID`
+
+Extracts 512-d appearance embeddings using OSNet-x1_0 (pretrained on ImageNet, auto-downloaded on first run).
+
+| Method | Description |
+|---|---|
+| `preprocess(crop)` | Resize → RGB → normalize → tensor |
+| `extract(crop)` | Returns L2-normalized 512-d numpy vector |
+| `extract_batch(crops)` | Batch extraction |
+
+> OSNet is an efficient Re-ID backbone that captures multi-scale features in a single forward pass, ideal for person matching under appearance variation.
+
+---
+
+### `core/memory.py` — `ReIDMemory`
+
+The most critical module — manages the identity gallery.
+
+| Method | Description |
+|---|---|
+| `begin_frame(active_track_ids)` | **Call once per frame.** Resets uniqueness set, purges dead track mappings |
+| `match(embedding, track_id)` | Returns stable `person_id` for this embedding |
+| `get_label(person_id)` | Returns `"person_N"` string |
+| `reset()` | Clears entire gallery (called on video loop restart) |
+
+**Internal gallery structure:**
+```python
+gallery[person_id] = {
+    "embedding":  np.ndarray,  # 512-d EMA-updated representative vector
+    "feats":      list,        # last N raw embeddings (history)
+    "last_seen":  float        # Unix timestamp — for TTL expiry
+}
+```
+
+**Frame-uniqueness mechanism:**
+```python
+_frame_used_ids: set  # person_ids already assigned THIS frame
+
+# During match():
+for pid in gallery:
+    if pid in _frame_used_ids:
+        continue  # Skip — person already found elsewhere in this frame
+```
+
+---
+
+### `core/pipeline.py` — `Pipeline`
+
+Per-frame orchestrator that connects all modules.
+
+```python
+pipeline = Pipeline()
+result = pipeline.process_frame(frame)   # returns persons + objects
+vis    = pipeline.draw(frame, result)    # returns annotated frame
+```
+
+**Colour coding (persons):**
+| person_id | Colour |
+|---|---|
+| person_1 | Green |
+| person_2 | Yellow-Cyan |
+| person_3 | Blue-Orange |
+| person_4 | Mint |
+| person_5 | Magenta |
+| ... (cycles) | ... |
+
+**Object boxes:** Always blue with class name + track_id label.
+
+---
+
+### `main.py` — CLI Entry Point
+
+```
+usage: main.py [--video PATH] [--out PATH] [--max-frames N]
+               [--no-show] [--loop] [--serve]
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--video PATH` | first `.mp4` in project root | Input video file |
+| `--out PATH` | None | Save annotated output video |
+| `--max-frames N` | None | Stop after N frames (for debugging) |
+| `--no-show` | off | Disable live preview window (headless) |
+| `--loop` | off | Replay video infinitely (gallery resets each loop) |
+| `--serve` | off | Start web dashboard at `http://localhost:8000` |
+
+**Live window keyboard controls:**
+| Key | Action |
+|---|---|
+| `Q` or `ESC` | Quit |
+| `Space` | Pause / Resume |
+
+---
+
+### `api/server.py` + `ui/index.html` — Web Dashboard
+
+FastAPI server exposing:
+- `GET /` → browser UI (`ui/index.html`)
+- `POST /upload` → upload a video file for processing
+- `WS /ws` → WebSocket stream: client sends frames / video paths, server returns annotated JPEG + detection JSON
+
+**WebSocket message types:**
+```json
+// Client → Server
+{ "type": "file",  "path": "weights/_tmp_video.mp4" }
+{ "type": "url",   "url":  "rtsp://camera/stream" }
+{ "type": "frame", "data": "<base64 JPEG>" }
+
+// Server → Client
+{ "image": "<base64 JPEG>", "persons": [...], "objects": [...] }
+```
+
+---
+
+## 5. How to Run
+
+### Prerequisites
+
+- Python 3.11 or 3.13
+- NVIDIA GPU with CUDA 12.x (optional but strongly recommended)
+- ~4 GB free RAM minimum; 8 GB recommended
+
+### Step 1 — Install Dependencies
+
+```bash
+# Install CUDA-enabled PyTorch (RTX 3050 / CUDA 12.4)
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124 --force-reinstall --no-deps
+
+# Install all other dependencies
+pip install torchreid gdown pycocotools lapx scipy opencv-python PyYAML
+pip install fastapi uvicorn[standard] python-multipart   # only needed for --serve
+```
+
+> **On first run**, OSNet weights (~11 MB) are auto-downloaded from Google Drive to `~/.cache/torch/checkpoints/`.
+
+### Step 2 — Verify GPU
+
+```bash
+python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+# Expected: True  NVIDIA GeForce RTX 3050 Laptop GPU
+```
+
+### Step 3 — Run
+
+```bash
+# ── Most common: live preview on default video ──
+python main.py
+
+# ── Watch in a loop (video replays, press Q to quit) ──
+python main.py --loop
+
+# ── Save annotated video to disk ──
+python main.py --out output_annotated.mp4
+
+# ── Loop + save (first pass only gets saved) ──
+python main.py --loop --out output_annotated.mp4
+
+# ── Use a specific video ──
+python main.py --video "C:/Videos/warehouse_cam1.mp4"
+
+# ── Headless (no window, just write output) ──
+python main.py --no-show --out output.mp4
+
+# ── Debug: process only first 60 frames ──
+python main.py --max-frames 60
+
+# ── Web dashboard ──
+python main.py --serve
+# Then open: http://localhost:8000
+```
+
+---
+
+## 6. Configuration Reference
+
+**File:** `configs/pipeline_config.yaml`
+
+```yaml
+detector:
+  model_name: "yolox-s"         # YOLOX variant
+  weights: "weights/yolox.pth"  # Path to custom-trained weights
+  input_size: [640, 640]        # Model input resolution (H, W)
+  conf_threshold: 0.35          # Min confidence to accept a detection
+  nms_threshold: 0.45           # IoU threshold for NMS suppression
+  class_names:                  # Class list (must match training order)
+    - person
+    - dock_open
+    - truck
+    - dock_closed
+    - forklift
+    - box_in_hand
+    - pallet_load
+    - no_truck
+  person_class_id: 0            # Which class index = person
+
+tracker:
+  track_thresh: 0.45    # Min score to activate a new track
+  track_buffer: 90      # Frames to keep a lost track alive (3s @ 30fps)
+  match_thresh: 0.85    # IoU threshold for track-detection matching
+  frame_rate: 30        # Source video FPS (affects Kalman filter)
+
+reid:
+  model_name: "osnet_x1_0"    # OSNet variant
+  weights: "weights/osnet.pth" # Optional custom weights (uses pretrained if missing)
+  input_size: [256, 128]       # Person crop resize (H, W)
+  device: "cuda"               # "cuda" or "cpu"
+
+memory:
+  cosine_threshold: 0.72   # Similarity to count as same person (0=anything, 1=identical)
+  max_gallery_size: 100    # Maximum distinct persons in gallery
+  feature_dim: 512         # Embedding dimension (OSNet output)
+  ttl_seconds: 300         # Seconds before an unseen person is removed from gallery
+  ema_alpha: 0.25          # EMA weight for gallery update (0=no update, 1=replace)
+  max_feats_per_person: 15 # How many raw embeddings to keep per person
+
+api:
+  host: "0.0.0.0"   # Bind address for web server
+  port: 8000        # Port for web server
+```
+
+### Tuning guide
+
+| Goal | Parameter to change |
+|---|---|
+| Fewer false detections | Raise `conf_threshold` (e.g. 0.40–0.50) |
+| More detections (catch far-away people) | Lower `conf_threshold` (e.g. 0.25) |
+| Stop losing tracks on fast movement | Raise `track_buffer` (e.g. 120) |
+| Same person gets new ID too often | Lower `cosine_threshold` (e.g. 0.60) |
+| Different people getting merged | Raise `cosine_threshold` (e.g. 0.78) |
+| Person removed from gallery too fast | Raise `ttl_seconds` (e.g. 600) |
+
+---
+
+## 7. Full Changelog — What We Changed & Why
+
+### Session 1 — Getting the Project Running
+
+#### Problem: Missing Python packages
+The project couldn't even import its own modules because required packages weren't installed.
+
+**Missing packages:**
+- `torchreid` — the OSNet Re-ID library
+- `gdown` — required internally by torchreid (Google Drive downloader)
+- `pycocotools` — required by YOLOX data pipeline
+
+**Fix:**
+```bash
+pip install torchreid gdown pycocotools
+```
+
+---
+
+#### Problem: `requirements.txt` was empty
+The requirements file existed but had no content, making it impossible to reproduce the environment.
+
+**Before:**
+```
+(empty file)
+```
+
+**After:**
+```
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.24.0
+pycocotools
+torchreid
+gdown
+lapx>=0.5.0
+scipy>=1.10.0
+opencv-python>=4.7.0
+PyYAML>=6.0
+fastapi
+uvicorn[standard]
+python-multipart
+```
+
+---
+
+#### Problem: No live preview window
+`main.py` processed frames and optionally wrote to a file, but never showed a window. You couldn't watch the tracker in real time.
+
+**Before:**
+```python
+# No cv2.imshow anywhere in main.py
+```
+
+**After (`main.py`):**
+```python
+cv2.namedWindow("Re-ID Tracker", cv2.WINDOW_NORMAL)
+cv2.resizeWindow("Re-ID Tracker", min(w, 1280), min(h, 720))
+# ...
+cv2.imshow("Re-ID Tracker", vis)
+key = cv2.waitKey(1) & 0xFF
+if key == ord("q") or key == 27:   # Q or ESC to quit
+    break
+elif key == ord(" "):              # Space to pause
+    cv2.waitKey(0)
+```
+
+Also added:
+- **FPS overlay** rendered directly on the frame
+- `--no-show` flag for headless server runs
+- `--loop` flag to replay video continuously (gallery resets each loop)
+- Frame counter display (`Frame: 133/241`)
+
+---
+
+### Session 2 — Fixing Re-ID Accuracy
+
+#### Bug 1 (Critical): Same person_id assigned to multiple people in one frame
+
+**Symptom:** In frame 133 of the video, 5 different warehouse workers were all labeled `person_3`.
+
+**Root cause:** The `match()` function in `memory.py` had no concept of "this person_id is already used in this frame." It would freely assign the same gallery ID to multiple detections if they all passed the cosine threshold.
+
+**Before (`core/memory.py`):**
+```python
+def match(self, embedding):
+    for pid in self.gallery:
+        score = self._cosine_similarity(embedding, gallery[pid])
+        if score > best_score:
+            best_score = score
+            best_id = pid
+    # No check: can pid already be in use this frame? NO.
+    if best_score >= threshold:
+        return best_id
+    else:
+        return new_id
+```
+
+**After (`core/memory.py`):**
+```python
+# Per-frame set of already-assigned person_ids
+_frame_used_ids: set = set()
+
+def begin_frame(self, active_track_ids):
+    """Call once per frame — resets uniqueness set."""
+    self._frame_used_ids = set()   # ← KEY: clear at frame start
+    # also purge dead track→person mappings
+    ...
+
+def match(self, embedding, track_id=None):
+    for pid in self.gallery:
+        if pid in self._frame_used_ids:
+            continue    # ← CORE FIX: skip already-assigned IDs
+        score = self._cosine_similarity(embedding, gallery[pid])
+        ...
+    self._frame_used_ids.add(assigned_id)   # ← mark as used
+    return assigned_id
+```
+
+**Result:** In a frame with 7 people, you now get 7 unique IDs (`person_1` through `person_7`), never duplicates.
+
+---
+
+#### Bug 2: IDs flipping on every frame (no track→person bridge)
+
+**Symptom:** A person would alternate between `person_2` and `person_5` on consecutive frames.
+
+**Root cause:** Every frame re-queried the full gallery for every track, so small variations in the embedding could flip the match.
+
+**Fix — Stable track→person cache:**
+```python
+_track_to_person: dict[int, int] = {}   # ByteTrack ID → person_id
+
+def match(self, embedding, track_id=None):
+    # Fast path: if this track already matched before, trust it
+    if track_id in self._track_to_person:
+        pid = self._track_to_person[track_id]
+        if pid in gallery and pid not in _frame_used_ids:
+            self._update_gallery(pid, embedding)
+            return pid   # ← same person, no gallery re-query
+
+    # ... (full gallery search only if no cache hit)
+    self._track_to_person[track_id] = assigned_id
+```
+
+When a ByteTrack track_id dies (person disappears), the cache entry is cleaned up by `begin_frame()`.
+
+---
+
+#### Improvement: Gallery embedding update — Simple list → EMA
+
+**Before:** Kept a list of up to 10 embeddings and computed their mean every match.
+```python
+feats.append(embedding)
+mean_feat = np.array(feats).mean(axis=0)
+```
+
+**After:** Exponential Moving Average for smooth, stable gallery evolution.
+```python
+entry["embedding"] = (
+    (1 - ema_alpha) * entry["embedding"]
+    + ema_alpha * embedding
+)
+# Re-normalize to unit length
+entry["embedding"] /= np.linalg.norm(entry["embedding"])
+```
+
+With `ema_alpha=0.25`, recent observations matter more but old ones still contribute — handles gradual appearance change (lighting, pose) gracefully.
+
+---
+
+#### Improvement: TTL (Time-to-Live) for gallery entries
+
+**Before:** Gallery entries lived forever — a person from 10 hours ago would still be in the gallery.
+
+**After:**
+```python
+ttl_seconds: 300   # 5 minutes
+
+def _expire_gallery(self):
+    now = time.time()
+    expired = [pid for pid, v in self.gallery.items()
+               if now - v["last_seen"] > self.ttl_seconds]
+    for pid in expired:
+        del self.gallery[pid]
+```
+
+---
+
+#### Config tuning: Raised cosine threshold
+
+| Parameter | Before | After | Reason |
+|---|---|---|---|
+| `cosine_threshold` | `0.65` | `0.72` | At 0.65, warehouse workers in similar uniforms were being merged into one identity. 0.72 is strict enough to separate them. |
+| `conf_threshold` | `0.30` | `0.35` | Reduces false positive detections of objects mistaken for people. |
+| `track_buffer` | `30` frames (1s) | `90` frames (3s) | Gives ByteTrack more patience before killing a track when someone is briefly occluded. |
+| `match_thresh` | `0.80` | `0.85` | Stricter IoU matching prevents tracks swapping between nearby people. |
+
+---
+
+#### Improvement: Unique colour per person identity
+
+**Before:** All persons drawn in a single green (`(0, 255, 0)`).
+
+**After:** 10-colour palette cycling by `person_id`:
+```python
+_PERSON_COLOURS = [
+    (0, 255, 0),    # green     ← person_1
+    (0, 200, 255),  # cyan      ← person_2
+    (255, 128, 0),  # orange    ← person_3
+    (0, 255, 200),  # mint      ← person_4
+    (200, 0, 255),  # magenta   ← person_5
+    ...
+]
+colour = _PERSON_COLOURS[(person_id - 1) % 10]
+```
+
+Also added filled background rectangles behind labels for better readability.
+
+---
+
+### Session 3 — GPU Acceleration
+
+#### Problem: PyTorch installed as CPU-only
+
+**Symptom:**
+```
+[ReID] CUDA requested but not available; using CPU
+```
+Pipeline ran at only **~2.5 FPS**.
+
+**Root cause:** PyTorch was installed as `torch==2.11.0+cpu` — a CPU-only build. The RTX 3050 GPU was completely unused.
+
+**Verification:**
+```bash
+python -c "import torch; print(torch.__version__)"
+# 2.11.0+cpu   ← no CUDA support
+nvidia-smi
+# NVIDIA GeForce RTX 3050 Laptop GPU | Driver 595.97 | CUDA 13.2
+```
+
+**Fix:**
+```bash
+pip install torch torchvision \
+    --index-url https://download.pytorch.org/whl/cu124 \
+    --force-reinstall --no-deps
+```
+
+**Result:**
+```
+[ReID] OSNet loaded on cuda        ← GPU active
+[main] pipeline-fps=7.9            ← was 2.5 FPS, now 7.9 FPS (3× speedup)
+```
+
+> **Why `cu124` and not `cu132`?** PyTorch CUDA wheels are built against specific CUDA toolkit versions. The highest available stable wheel for Python 3.13 at time of install was `cu124` (CUDA 12.4). NVIDIA driver 595.97 is forward-compatible — it can run CUDA 12.4 code despite reporting CUDA 13.2.
+
+---
+
+## 8. Known Limitations
+
+| Limitation | Details |
+|---|---|
+| **~7-8 FPS on RTX 3050** | YOLOX and OSNet both run sequentially on CPU→GPU. Could reach 15–25 FPS with batch inference or model quantization (TensorRT). |
+| **Re-ID under heavy occlusion** | If a person is hidden for longer than `track_buffer` frames AND their gallery TTL expires, they will get a new ID. Increase `track_buffer` and `ttl_seconds` to mitigate. |
+| **Similar-looking people** | Workers in identical uniforms + helmets may match each other's gallery entries. Raise `cosine_threshold` to 0.80+ to be stricter (at cost of more new IDs on re-entry). |
+| **YOLOX custom classes** | The detector is trained on warehouse-specific classes only. It will not detect people in significantly different environments without retraining. |
+| **No person count deduplication** | The "Persons: 7" overlay counts active ByteTrack tracks, not unique gallery entries. |
