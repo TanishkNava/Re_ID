@@ -12,6 +12,10 @@ sys.path.insert(0, str(_ROOT / "YOLOX"))
 
 from core.pipeline import Pipeline
 
+# #region agent log
+from core.debug_log import log as _dbg_log
+# #endregion
+
 
 def prompt_video_path() -> Path | None:
     import tkinter as tk
@@ -62,8 +66,9 @@ def run_video_cli(
     if show:
         cv2.namedWindow("Re-ID Tracker", cv2.WINDOW_NORMAL)
         cv2.resizeWindow("Re-ID Tracker", min(w, 1280), min(h, 720))
+        print("[main] Keys: Space = pause/resume, Q or ESC = quit.")
 
-    loop_n   = 0
+    loop_n    = 0
     quit_flag = False
 
     while not quit_flag:
@@ -75,54 +80,82 @@ def run_video_cli(
         fps_disp = 0.0
         t_fps    = time.perf_counter()
         loop_n  += 1
+        paused   = False
+        last_vis = None
         if loop_n > 1:
             print(f"[main] --- Loop {loop_n} ---")
 
         while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            if max_frames is not None and frame_i >= max_frames:
-                break
+            if not paused:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                if max_frames is not None and frame_i >= max_frames:
+                    break
 
-            result = pipeline.process_frame(frame)
-            vis    = pipeline.draw(frame.copy(), result)
+                result = pipeline.process_frame(frame)
+                vis    = pipeline.draw(frame.copy(), result)
+                last_vis = vis
 
-            # ── FPS overlay ───────────────────────────────────────────────
-            now = time.perf_counter()
-            if now - t_fps >= 0.5:
-                fps_disp = frame_i / max(now - t_run, 1e-3)
-                t_fps    = now
+                # ── FPS overlay ───────────────────────────────────────────
+                now = time.perf_counter()
+                if now - t_fps >= 0.5:
+                    fps_disp = frame_i / max(now - t_run, 1e-3)
+                    t_fps    = now
 
-            n_p, n_o = len(result["persons"]), len(result["objects"])
-            loop_tag = f"  Loop:{loop_n}" if loop else ""
-            overlay  = (
-                f"FPS: {fps_disp:.1f}  |  Persons: {n_p}  Objects: {n_o}"
-                f"  |  Frame: {frame_i}/{total if total > 0 else '?'}{loop_tag}"
-            )
-            cv2.rectangle(vis, (0, 0), (len(overlay) * 9 + 10, 28), (0, 0, 0), -1)
-            cv2.putText(vis, overlay, (6, 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 230, 230), 2)
+                n_p, n_o = len(result["persons"]), len(result["objects"])
+                loop_tag = f"  Loop:{loop_n}" if loop else ""
+                hint = "  [Space] pause  [Q] quit"
+                overlay  = (
+                    f"FPS: {fps_disp:.1f}  |  Persons: {n_p}  Objects: {n_o}"
+                    f"  |  Frame: {frame_i}/{total if total > 0 else '?'}{loop_tag}{hint}"
+                )
+                cv2.rectangle(vis, (0, 0), (min(len(overlay) * 8 + 16, w), 28), (0, 0, 0), -1)
+                cv2.putText(vis, overlay, (6, 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 230, 230), 2)
 
-            if writer:
-                writer.write(vis)
+                if writer:
+                    writer.write(vis)
 
-            if show:
-                cv2.imshow("Re-ID Tracker", vis)
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord("q") or key == 27:   # q or ESC to quit
+                frame_i += 1
+                if frame_i % 30 == 0:
+                    elapsed = time.perf_counter() - t_run
+                    print(
+                        f"[main] frame={frame_i}  persons={n_p}  objects={n_o}"
+                        f"  pipeline-fps={frame_i / elapsed:.1f}"
+                    )
+            else:
+                vis = last_vis
+                if vis is None:
+                    break
+                n_p = n_o = 0
+
+            if show and vis is not None:
+                display = vis
+                if paused:
+                    display = vis.copy()
+                    cv2.rectangle(display, (0, 0), (min(420, w), 36), (0, 0, 0), -1)
+                    cv2.putText(
+                        display,
+                        "PAUSED  —  Space: play  |  Q/ESC: quit",
+                        (8, 24),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.65,
+                        (80, 80, 255),
+                        2,
+                    )
+                cv2.imshow("Re-ID Tracker", display)
+                key = cv2.waitKey(30 if paused else 1) & 0xFF
+                if key == ord("q") or key == 27:
                     print("[main] Quit by user.")
                     quit_flag = True
                     break
-                elif key == ord(" "):              # Space to pause
-                    print("[main] Paused — press any key to resume.")
-                    cv2.waitKey(0)
-
-            frame_i += 1
-            if frame_i % 30 == 0:
-                elapsed = time.perf_counter() - t_run
-                print(f"[main] frame={frame_i}  persons={n_p}  objects={n_o}"
-                      f"  pipeline-fps={frame_i / elapsed:.1f}")
+                if key == ord(" "):
+                    paused = not paused
+                    if paused:
+                        print("[main] Paused (Space to resume).")
+                    else:
+                        print("[main] Playing.")
 
         if not loop or quit_flag:
             break
@@ -186,6 +219,23 @@ def main() -> None:
         help="Start web server: open http://127.0.0.1:8000/ for UI (models load on first WebSocket use)",
     )
     args = ap.parse_args()
+
+    # #region agent log
+    _dbg_log(
+        run_id="pre-fix",
+        hypothesis_id="H5",
+        location="main.py:main",
+        message="CLI args parsed",
+        data={
+            "serve": bool(args.serve),
+            "video": str(args.video) if args.video else None,
+            "out": str(args.out) if args.out else None,
+            "max_frames": args.max_frames,
+            "no_show": bool(args.no_show),
+            "loop": bool(args.loop),
+        },
+    )
+    # #endregion
 
     if args.serve:
         run_server()

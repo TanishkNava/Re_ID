@@ -1,14 +1,75 @@
-import torch
 import numpy as np
 import cv2
 import yaml
-import torchreid
+
+# #region agent log
+from core.debug_log import log as _dbg_log
+# #endregion
+
+try:
+    import torch
+except Exception as e:
+    torch = None  # type: ignore[assignment]
+    # #region agent log
+    _dbg_log(
+        run_id="pre-fix",
+        hypothesis_id="H2",
+        location="core/reid.py:import",
+        message="Failed to import torch",
+        data={"error": repr(e)},
+    )
+    # #endregion
+
+try:
+    import torchreid  # type: ignore
+except Exception as e:
+    torchreid = None  # type: ignore[assignment]
+    # #region agent log
+    _dbg_log(
+        run_id="pre-fix",
+        hypothesis_id="H1",
+        location="core/reid.py:import",
+        message="torchreid import failed; will use fallback backend",
+        data={"error": repr(e)},
+    )
+    # #endregion
+
+try:
+    from torchvision import models as tv_models  # type: ignore
+except Exception as e:
+    tv_models = None  # type: ignore[assignment]
+    # #region agent log
+    _dbg_log(
+        run_id="pre-fix",
+        hypothesis_id="H3",
+        location="core/reid.py:import",
+        message="Failed to import torchvision models",
+        data={"error": repr(e)},
+    )
+    # #endregion
 
 
 class OSNetReID:
     def __init__(self, config_path="configs/pipeline_config.yaml"):
         with open(config_path) as f:
             cfg = yaml.safe_load(f)["reid"]
+
+        # #region agent log
+        _dbg_log(
+            run_id="pre-fix",
+            hypothesis_id="H4",
+            location="core/reid.py:OSNetReID.__init__",
+            message="Initializing ReID",
+            data={
+                "config_path": str(config_path),
+                "model_name": cfg.get("model_name"),
+                "device_cfg": cfg.get("device"),
+            },
+        )
+        # #endregion
+
+        if torch is None:
+            raise RuntimeError("PyTorch is required for ReID but could not be imported.")
 
         dev = str(cfg.get("device", "cuda")).strip().lower()
         if dev == "cpu":
@@ -20,15 +81,36 @@ class OSNetReID:
             self.device = torch.device("cpu")
         self.input_size = tuple(cfg["input_size"])  # (256, 128)
 
+        self.backend = "torchreid" if torchreid is not None else "torchvision_fallback"
+
         # Build model
-        self.model = torchreid.models.build_model(
-            name=cfg["model_name"],
-            num_classes=1000,
-            pretrained=True
+        if torchreid is not None:
+            self.model = torchreid.models.build_model(
+                name=cfg["model_name"],
+                num_classes=1000,
+                pretrained=True
+            )
+        else:
+            if tv_models is None:
+                raise RuntimeError("Neither torchreid nor torchvision is available for ReID.")
+            # Fallback: resnet18 embedding (512-d after avgpool). Lower accuracy than OSNet.
+            backbone = tv_models.resnet18(weights=tv_models.ResNet18_Weights.DEFAULT)
+            backbone.fc = torch.nn.Identity()
+            self.model = backbone
+
+        # #region agent log
+        _dbg_log(
+            run_id="pre-fix",
+            hypothesis_id="H1",
+            location="core/reid.py:OSNetReID.__init__",
+            message="ReID backend selected",
+            data={"backend": self.backend, "device": str(self.device)},
         )
+        # #endregion
+
         self.model = self.model.to(self.device)
         self.model.eval()
-        print(f"[ReID] OSNet loaded on {self.device}")
+        print(f"[ReID] ReID model loaded on {self.device} ({self.backend})")
 
         # ImageNet normalization
         self.mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)

@@ -27,6 +27,12 @@
   .btn-primary { background: #00e5ff; color: #000; }
   .btn-danger  { background: #ff4444; color: #fff; }
   .btn-upload  { background: #7c3aed; color: #fff; }
+  .btn-secondary { background: #2a2a3e; color: #ccc; border: 1px solid #444; }
+  .btn-row { display: flex; gap: 8px; }
+  .btn-row button { flex: 1; }
+  .btn-secondary:disabled, .btn-primary:disabled { opacity: 0.35; cursor: not-allowed; }
+  .hint { font-size: 0.72rem; color: #666; line-height: 1.35; }
+  .viewer.drag { outline: 2px dashed #00e5ff; outline-offset: -4px; }
 
   /* Stats */
   .stats { padding: 16px; border-bottom: 1px solid #222; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
@@ -61,11 +67,11 @@
 
 <div class="container">
   <!-- Video viewer -->
-  <div class="viewer">
+  <div class="viewer" id="viewer-drop">
     <canvas id="canvas"></canvas>
     <div class="placeholder" id="placeholder">
       <div style="font-size:2.5rem;margin-bottom:12px">🎥</div>
-      <div>Upload a video or enter a stream URL to begin</div>
+      <div>Upload a video, drag &amp; drop here, or enter a stream URL</div>
     </div>
   </div>
 
@@ -75,9 +81,16 @@
       <h2>Input Source</h2>
       <input type="text" id="url-input" placeholder="Stream URL (rtsp:// or http://)">
       <button class="btn-primary" onclick="startStream()">▶ Start Stream</button>
-      <input type="file" id="file-input" accept="video/*">
-      <button class="btn-upload" onclick="uploadVideo()">⬆ Upload Video</button>
+      <input type="file" id="file-input" accept="video/*,.mp4,.avi,.mov,.mkv,.webm">
+      <button class="btn-upload" onclick="uploadVideo()">⬆ Upload &amp; Run</button>
+      <p class="hint">Choose a file, then Upload &amp; Run — or drop a video onto the preview.</p>
+      <h2 style="margin-top:8px">Playback</h2>
+      <div class="btn-row">
+        <button class="btn-secondary" id="btn-play" onclick="sendPlay()" disabled>▶ Play</button>
+        <button class="btn-secondary" id="btn-pause" onclick="sendPause()" disabled>⏸ Pause</button>
+      </div>
       <button class="btn-danger" onclick="stopAll()">⏹ Stop</button>
+      <p class="hint">While streaming: Space toggles pause/play.</p>
     </div>
 
     <div class="stats">
@@ -104,16 +117,29 @@
   let frameCount = 0;
   let fpsTimer = null;
   let fpsCounter = 0;
+  let streaming = false;
+  let paused = false;
 
   const canvas      = document.getElementById("canvas");
   const ctx         = canvas.getContext("2d");
   const placeholder = document.getElementById("placeholder");
+  const viewerDrop  = document.getElementById("viewer-drop");
+
+  function setPlaybackControls() {
+    const live = streaming && ws && ws.readyState === WebSocket.OPEN;
+    document.getElementById("btn-play").disabled = !live || !paused;
+    document.getElementById("btn-pause").disabled = !live || paused;
+  }
 
   function setStatus(text, live = false) {
     document.getElementById("status-dot").className  = "dot" + (live ? " live" : "");
     document.getElementById("status-text").textContent = text;
-    document.getElementById("mode-badge").textContent   = live ? "LIVE" : "Idle";
+    document.getElementById("mode-badge").textContent =
+      streaming && ws && ws.readyState === WebSocket.OPEN
+        ? (paused ? "PAUSED" : "LIVE")
+        : "Idle";
     document.getElementById("status-time").textContent  = new Date().toLocaleTimeString();
+    setPlaybackControls();
   }
 
   function updateStats(persons, objects) {
@@ -154,6 +180,7 @@
   }
 
   function startFPSCounter() {
+    clearInterval(fpsTimer);
     fpsTimer = setInterval(() => {
       document.getElementById("stat-fps").textContent = fpsCounter;
       fpsCounter = 0;
@@ -167,39 +194,134 @@
   }
 
   function connectWS(onOpen) {
-    stopAll();
+    stopAll({ skipControl: true });
+    streaming = true;
+    paused = false;
     ws = new WebSocket(`ws://${location.host}/ws`);
-    ws.onopen = () => { setStatus("Connected", true); startFPSCounter(); onOpen(); };
-    ws.onclose = () => { setStatus("Disconnected"); clearInterval(fpsTimer); };
+    ws.onopen = () => {
+      setStatus("Connected", true);
+      startFPSCounter();
+      onOpen();
+    };
+    ws.onclose = () => {
+      streaming = false;
+      paused = false;
+      setStatus("Disconnected");
+      clearInterval(fpsTimer);
+      setPlaybackControls();
+    };
     ws.onerror = () => setStatus("Error");
     ws.onmessage = (e) => {
       const data = JSON.parse(e.data);
-      if (data.error) { setStatus("Error: " + data.error); return; }
-      drawFrame(data.image);
-      updateStats(data.persons, data.objects);
+      if (data.error) {
+        streaming = false;
+        setStatus("Error: " + data.error);
+        return;
+      }
+      if (data.event === "stream_end") {
+        streaming = false;
+        paused = false;
+        setStatus("Stream finished");
+        setPlaybackControls();
+        return;
+      }
+      if (data.image) {
+        drawFrame(data.image);
+        updateStats(data.persons, data.objects);
+      }
     };
   }
 
-  function stopAll() {
-    if (ws) { ws.close(); ws = null; }
+  function sendPause() {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ type: "control", action: "pause" }));
+    paused = true;
+    setStatus("Paused", true);
+  }
+
+  function sendPlay() {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ type: "control", action: "play" }));
+    paused = false;
+    setStatus("Connected", true);
+  }
+
+  function stopAll(opts = {}) {
+    if (ws && ws.readyState === WebSocket.OPEN && !opts.skipControl) {
+      try {
+        ws.send(JSON.stringify({ type: "control", action: "stop" }));
+      } catch (_) {}
+    }
+    if (ws) {
+      ws.close();
+      ws = null;
+    }
+    streaming = false;
+    paused = false;
     clearInterval(fpsTimer);
     setStatus("Stopped");
+    setPlaybackControls();
   }
-async function uploadVideo() {
-  const file = document.getElementById("file-input").files[0];
-  if (!file) return alert("Select a video file first.");
-  
-  setStatus("Uploading...");
-  const form = new FormData();
-  form.append("file", file);
-  const res  = await fetch("/upload", { method: "POST", body: form });
-  const data = await res.json();
-  
-  // Now process via WebSocket
-  connectWS(() => {
-    ws.send(JSON.stringify({ type: "file", path: data.path }));
+
+  document.addEventListener("keydown", (e) => {
+    if (e.code !== "Space") return;
+    if (!streaming || !ws || ws.readyState !== WebSocket.OPEN) return;
+    e.preventDefault();
+    if (paused) sendPlay();
+    else sendPause();
   });
-}
+
+  viewerDrop.addEventListener("dragover", (e) => {
+    e.preventDefault();
+    viewerDrop.classList.add("drag");
+  });
+  viewerDrop.addEventListener("dragleave", () => viewerDrop.classList.remove("drag"));
+  viewerDrop.addEventListener("drop", (e) => {
+    e.preventDefault();
+    viewerDrop.classList.remove("drag");
+    const f = e.dataTransfer.files[0];
+    if (!f) return;
+    runUploadedFile(f);
+  });
+
+  async function runUploadedFile(file) {
+    setStatus("Uploading...");
+    const form = new FormData();
+    form.append("file", file);
+    let res;
+    try {
+      res = await fetch("/upload", { method: "POST", body: form });
+    } catch (err) {
+      setStatus("Upload failed (network)");
+      return;
+    }
+    if (!res.ok) {
+      setStatus("Upload failed: HTTP " + res.status);
+      return;
+    }
+    const data = await res.json();
+    if (!data.path) {
+      setStatus("Upload failed: no path in response");
+      return;
+    }
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      streaming = true;
+      paused = false;
+      startFPSCounter();
+      setStatus("Connected", true);
+      ws.send(JSON.stringify({ type: "file", path: data.path }));
+      return;
+    }
+    connectWS(() => {
+      ws.send(JSON.stringify({ type: "file", path: data.path }));
+    });
+  }
+
+  async function uploadVideo() {
+    const file = document.getElementById("file-input").files[0];
+    if (!file) return alert("Select a video file first.");
+    await runUploadedFile(file);
+  }
 </script>
 </body>
 </html>

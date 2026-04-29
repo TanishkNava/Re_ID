@@ -113,9 +113,7 @@ class Pipeline:
         Persons → unique colour per person_id.
         Objects → blue box with class label.
         """
-        import yaml
-        with open(self._config_path) as f:
-            class_names = yaml.safe_load(f)["detector"]["class_names"]
+        class_names = self.detector.class_names
 
         BLUE  = (255, 100, 0)
         WHITE = (255, 255, 255)

@@ -10,19 +10,60 @@ from yolox.utils import fuse_model, postprocess
 from yolox.data.data_augment import ValTransform
 
 
+def _infer_num_classes_from_state_dict(state_dict: dict) -> int | None:
+    """Read YOLOX head cls_pred channel count from a checkpoint (one value per detection class)."""
+    for name, tensor in state_dict.items():
+        if not isinstance(tensor, torch.Tensor):
+            continue
+        if "cls_preds" in name and name.endswith(".weight") and tensor.ndim == 4:
+            return int(tensor.shape[0])
+    return None
+
+
 class YOLOXDetector:
     def __init__(self, config_path="configs/pipeline_config.yaml"):
         with open(config_path) as f:
             cfg = yaml.safe_load(f)["detector"]
 
-        self.class_names   = cfg["class_names"]
+        self.class_names   = list(cfg["class_names"])
         self.person_id     = cfg["person_class_id"]
         self.conf_thresh   = cfg["conf_threshold"]
         self.nms_thresh    = cfg["nms_threshold"]
         self.input_size    = tuple(cfg["input_size"])
         self.device        = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Build exp and model
+        weights_path = cfg["weights"]
+        ckpt = None
+        if Path(weights_path).exists():
+            ckpt = torch.load(weights_path, map_location=self.device, weights_only=False)
+            raw = ckpt.get("model", ckpt)
+            if isinstance(raw, dict):
+                nc_ckpt = _infer_num_classes_from_state_dict(raw)
+                nc_yaml = len(self.class_names)
+                if nc_ckpt is not None and nc_ckpt != nc_yaml:
+                    print(
+                        f"[Detector] Weights define num_classes={nc_ckpt}, "
+                        f"config has {nc_yaml} names — using checkpoint count."
+                    )
+                    if nc_ckpt < nc_yaml:
+                        dropped = self.class_names[nc_ckpt:]
+                        self.class_names = self.class_names[:nc_ckpt]
+                        print(f"[Detector] Dropped class name(s) (unused by this ckpt): {dropped}")
+                    else:
+                        for i in range(nc_yaml, nc_ckpt):
+                            self.class_names.append(f"class_{i}")
+                        print(
+                            f"[Detector] Appended placeholder names class_{nc_yaml}..class_{nc_ckpt - 1}; "
+                            f"set detector.class_names in YAML to match training order."
+                        )
+                if self.person_id >= len(self.class_names):
+                    print(
+                        f"[Detector] WARNING: person_class_id={self.person_id} is out of range "
+                        f"for {len(self.class_names)} classes; clamping to 0."
+                    )
+                    self.person_id = 0
+
+        # Build exp and model (num_classes must match checkpoint)
         exp = get_exp(None, cfg["model_name"])
         exp.num_classes    = len(self.class_names)
         exp.test_conf      = self.conf_thresh
@@ -32,11 +73,9 @@ class YOLOXDetector:
         self.model = exp.get_model().to(self.device)
         self.model.eval()
 
-        # Load weights
-        weights_path = cfg["weights"]
-        if Path(weights_path).exists():
-            ckpt = torch.load(weights_path, map_location=self.device, weights_only=False)
-            self.model.load_state_dict(ckpt.get("model", ckpt))
+        if ckpt is not None:
+            raw = ckpt.get("model", ckpt)
+            self.model.load_state_dict(raw)
             print(f"[Detector] Weights loaded from {weights_path}")
         else:
             print(f"[Detector] WARNING: No weights at {weights_path}, using random weights")
